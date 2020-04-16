@@ -1,0 +1,106 @@
+commit 69fe885347080c72de428cf6bb6f727b3850e6f1
+Author: Dmitry V. Levin <ldv@altlinux.org>
+Date:   Tue Mar 31 22:57:10 2020 +0000
+
+    tests: fix get*id-creds tests on mips
+    
+    Apparently, mips executables may invoke prctl(PR_GET_FP_MODE) on their
+    own.  Since these calls are not filtered out by %creds, they have to be
+    dealt with before comparison.
+    
+    * tests/getuid.test [$STRACE_ARCH == mips]: Filter out
+    prctl(PR_GET_FP_MODE) from the log of %creds tests.
+
+diff --git a/tests/getuid.test b/tests/getuid.test
+index 50ed835c7..e8351a221 100755
+--- a/tests/getuid.test
++++ b/tests/getuid.test
+@@ -9,14 +9,25 @@
+ 
+ . "${srcdir=.}/init.sh"
+ 
++check_prog grep
+ check_prog uniq
++
+ if [ "${NAME%-creds}" = "$NAME" ]; then
+ 	syscall="$NAME"
+ else
+ 	NAME="${NAME%-creds}"
+ 	syscall='%creds'
+ fi
++
+ run_prog > /dev/null
+ run_strace -qq -a9 -e"$syscall" $args > "$EXP"
+-uniq < "$LOG" > "$OUT"
++
++case "$STRACE_ARCH:$syscall" in
++	mips:%creds)
++		grep -Fxv 'prctl(PR_GET_FP_MODE) = 0' < "$LOG" | uniq > "$OUT"
++		;;
++	*)	uniq < "$LOG" > "$OUT"
++		;;
++esac
++
+ match_diff "$OUT" "$EXP"
+diff --git a/tests-m32/getuid.test b/tests-m32/getuid.test
+index 50ed835c7..e8351a221 100755
+--- a/tests-m32/getuid.test
++++ b/tests-m32/getuid.test
+@@ -9,14 +9,25 @@
+ 
+ . "${srcdir=.}/init.sh"
+ 
++check_prog grep
+ check_prog uniq
++
+ if [ "${NAME%-creds}" = "$NAME" ]; then
+ 	syscall="$NAME"
+ else
+ 	NAME="${NAME%-creds}"
+ 	syscall='%creds'
+ fi
++
+ run_prog > /dev/null
+ run_strace -qq -a9 -e"$syscall" $args > "$EXP"
+-uniq < "$LOG" > "$OUT"
++
++case "$STRACE_ARCH:$syscall" in
++	mips:%creds)
++		grep -Fxv 'prctl(PR_GET_FP_MODE) = 0' < "$LOG" | uniq > "$OUT"
++		;;
++	*)	uniq < "$LOG" > "$OUT"
++		;;
++esac
++
+ match_diff "$OUT" "$EXP"
+diff --git a/tests-mx32/getuid.test b/tests-mx32/getuid.test
+index 50ed835c7..e8351a221 100755
+--- a/tests-mx32/getuid.test
++++ b/tests-mx32/getuid.test
+@@ -9,14 +9,25 @@
+ 
+ . "${srcdir=.}/init.sh"
+ 
++check_prog grep
+ check_prog uniq
++
+ if [ "${NAME%-creds}" = "$NAME" ]; then
+ 	syscall="$NAME"
+ else
+ 	NAME="${NAME%-creds}"
+ 	syscall='%creds'
+ fi
++
+ run_prog > /dev/null
+ run_strace -qq -a9 -e"$syscall" $args > "$EXP"
+-uniq < "$LOG" > "$OUT"
++
++case "$STRACE_ARCH:$syscall" in
++	mips:%creds)
++		grep -Fxv 'prctl(PR_GET_FP_MODE) = 0' < "$LOG" | uniq > "$OUT"
++		;;
++	*)	uniq < "$LOG" > "$OUT"
++		;;
++esac
++
+ match_diff "$OUT" "$EXP"

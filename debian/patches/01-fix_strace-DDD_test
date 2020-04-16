@@ -1,0 +1,1185 @@
+Fix problems with strace-DDD.test. Start with this commit from
+upstream:
+
+commit 00a29af7081ef4a7c4e5b538290b4a21fed5ef38
+Author: Dmitry V. Levin <ldv@altlinux.org>
+Date:   Sat Mar 28 16:57:34 2020 +0000
+
+    tests: fix strace-DDD.test for the case when strace has a process subreaper
+    
+    The test used to assume that the process reaper has pid 1, which is not
+    necessarily the case, e.g. there might be a process subreaper different
+    from pid 1.
+    
+    * tests/get_process_reaper.c: New file.
+    * tests/Makefile.am (check_PROGRAMS): Add get_process_reaper.
+    * tests/.gitignore: Likewise.
+    * tests/strace-DDD.test: Invoke get_process_reaper to find out
+    the process reaper id, use the latter in subsequent checks
+    instead of pid 1.
+    
+    References: https://bugs.debian.org/947396
+    Resolves: https://github.com/strace/strace/issues/129
+
+But then we have to expand the patch from tests/Makefile.am to
+tests{,-m32,-mx32}/Makefile.{am,in}. Messy, but that's the cost of
+making these changes after bootstrap/automake/autoconf.
+
+diff --git a/tests/Makefile.am b/tests/Makefile.am
+index f2a5bc6d8..8a5819de2 100644
+--- a/tests/Makefile.am
++++ b/tests/Makefile.am
+@@ -111,6 +111,7 @@ check_PROGRAMS = $(PURE_EXECUTABLES) \
+ 	filter-unavailable \
+ 	fork-f \
+ 	fsync-y \
++	get_process_reaper \
+ 	getpid	\
+ 	getppid	\
+ 	gettid \
+diff --git a/tests/get_process_reaper.c b/tests/get_process_reaper.c
+new file mode 100644
+index 000000000..3c00c584b
+--- /dev/null
++++ b/tests/get_process_reaper.c
+@@ -0,0 +1,108 @@
++/*
++ * Print the process reaper id.
++ *
++ * Copyright (c) 2020 Dmitry V. Levin <ldv@altlinux.org>
++ * All rights reserved.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "tests.h"
++#include <stdio.h>
++#include <unistd.h>
++#include <sys/wait.h>
++
++/* PARENT - CHILD - GRANDCHILD */
++
++static int
++grandchild(int read_fd, int write_fd)
++{
++	/* wait for notification from PARENT about CHILD completion */
++	pid_t pid;
++	if (read(read_fd, &pid, sizeof(pid)) != 0)
++		perror_msg_and_fail("read");
++
++	/* write ppid to PARENT */
++	pid = getppid();
++	if (write(write_fd, &pid, sizeof(pid)) != sizeof(pid))
++		perror_msg_and_fail("write");
++
++	_exit(0);
++}
++
++static int
++child(int read_fd, int write_fd)
++{
++	pid_t pid = fork();
++	if (pid < 0)
++		perror_msg_and_fail("fork");
++
++	if (!pid)
++		return grandchild(read_fd, write_fd);
++	else
++		_exit(0);
++}
++
++static int
++parent(pid_t pid, int read_fd, int write_fd)
++{
++	/* wait for CHILD completion */
++	int status;
++	if (waitpid(pid, &status, 0) != pid)
++		perror_msg_and_fail("waitpid");
++	if (status != 0)
++		error_msg_and_fail("status %x", status);
++
++	/* notify GRANDCHILD about CHILD completion */
++	close(write_fd),
++	      write_fd = -1;
++
++	/* read ppid of GRANDCHILD */
++	if (read(read_fd, &pid, sizeof(pid)) != sizeof(pid))
++		perror_msg_and_fail("read");
++
++	printf("%d\n", pid);
++	return 0;
++}
++
++int
++main(void)
++{
++	int parent_grandchild_fds[2];
++#define parent_read_fd		parent_grandchild_fds[0]
++#define grandchild_write_fd	parent_grandchild_fds[1]
++
++	int grandchild_parent_fds[2];
++#define	grandchild_read_fd	grandchild_parent_fds[0]
++#define	parent_write_fd		grandchild_parent_fds[1]
++
++	if (pipe(parent_grandchild_fds) ||
++	    pipe(grandchild_parent_fds))
++		perror_msg_and_fail("pipe");
++
++	pid_t pid = fork();
++	if (pid < 0)
++		perror_msg_and_fail("fork");
++
++	if (!pid) {
++		/* CHILD */
++		close(parent_read_fd),
++		      parent_read_fd = -1;
++
++		close(parent_write_fd),
++		      parent_write_fd = -1;
++
++		return child(grandchild_read_fd,
++			     grandchild_write_fd);
++	} else {
++		/* PARENT */
++		close(grandchild_read_fd),
++		      grandchild_read_fd = -1;
++
++		close(grandchild_write_fd),
++		      grandchild_write_fd = -1;
++
++		return parent(pid, parent_read_fd,
++				   parent_write_fd);
++	}
++}
+diff --git a/tests/strace-DDD.test b/tests/strace-DDD.test
+index e478ae5e8..671600bbe 100755
+--- a/tests/strace-DDD.test
++++ b/tests/strace-DDD.test
+@@ -19,10 +19,14 @@ stat_file=/proc/self/stat
+ [ -f "$stat_file" ] ||
+ 	framework_skip_ "$stat_file is not available"
+ 
++reapid="$(../get_process_reaper)" && [ "$reapid" -ge 1 ] ||
++	fail_ 'get_process_reaper failed'
++
+ set -- -enone -esignal=none ../tracer_ppid_pgid_sid
+ run_strace "$@" > "$OUT"
+ read -r ppid pgid sid < "$OUT" &&
+ [ "$ppid" -gt 1 ] &&
++[ "$ppid" -ne "$reapid" ] &&
+ [ "$pgid" -ge 0 ] &&
+ [ "$sid" -ge 0 ] || {
+ 	cat < "$OUT" > "$LOG"
+@@ -35,7 +39,7 @@ sid0="$sid"
+ 
+ run_strace -D "$@" > "$OUT"
+ read -r ppid pgid sid < "$OUT" &&
+-[ "$ppid" -eq 1 ] &&
++[ "$ppid" -eq "$reapid" ] &&
+ [ "$pgid" = "$pgid0" ] &&
+ [ "$sid" = "$sid0" ] || {
+ 	cat < "$OUT" > "$LOG"
+@@ -45,8 +49,9 @@ match_diff
+ 
+ run_strace -DD "$@" > "$OUT"
+ read -r ppid pgid sid < "$OUT" &&
+-[ "$ppid" -eq 1 ] &&
++[ "$ppid" -eq "$reapid" ] &&
+ [ "$pgid" -gt 1 ] &&
++[ "$pgid" -ne "$reapid" ] &&
+ [ "$pgid" != "$pgid0" ] &&
+ [ "$pgid" != "$sid" ] &&
+ [ "$sid" = "$sid0" ] || {
+@@ -57,8 +62,9 @@ match_diff
+ 
+ run_strace -DDD "$@" > "$OUT"
+ read -r ppid pgid sid < "$OUT" &&
+-[ "$ppid" -eq 1 ] &&
++[ "$ppid" -eq "$reapid" ] &&
+ [ "$pgid" -gt 1 ] &&
++[ "$pgid" -ne "$reapid" ] &&
+ [ "$pgid" != "$pgid0" ] &&
+ [ "$sid" = "$pgid" ] &&
+ [ "$sid" != "$sid0" ] || {
+diff --git a/tests/Makefile.in b/tests/Makefile.in
+index 309fe4443..783230ecc 100644
+--- a/tests/Makefile.in
++++ b/tests/Makefile.in
+@@ -118,9 +118,9 @@ check_PROGRAMS = $(am__EXEEXT_1) _newselect-P$(EXEEXT) answer$(EXEEXT) \
+ 	count-f$(EXEEXT) delay$(EXEEXT) execve-v$(EXEEXT) \
+ 	execveat-v$(EXEEXT) filter_seccomp-flag$(EXEEXT) \
+ 	filter_seccomp-perf$(EXEEXT) filter-unavailable$(EXEEXT) \
+-	fork-f$(EXEEXT) fsync-y$(EXEEXT) getpid$(EXEEXT) \
+-	getppid$(EXEEXT) gettid$(EXEEXT) inject-nf$(EXEEXT) \
+-	int_0x80$(EXEEXT) ioctl_dm-v$(EXEEXT) \
++	fork-f$(EXEEXT) fsync-y$(EXEEXT) get_process_reaper$(EXEEXT) \
++	getpid$(EXEEXT) getppid$(EXEEXT) gettid$(EXEEXT) \
++	inject-nf$(EXEEXT) int_0x80$(EXEEXT) ioctl_dm-v$(EXEEXT) \
+ 	ioctl_evdev-success$(EXEEXT) \
+ 	ioctl_evdev-success-Xabbrev$(EXEEXT) \
+ 	ioctl_evdev-success-Xraw$(EXEEXT) \
+@@ -944,6 +944,10 @@ get_mempolicy_SOURCES = get_mempolicy.c
+ get_mempolicy_OBJECTS = get_mempolicy.$(OBJEXT)
+ get_mempolicy_LDADD = $(LDADD)
+ get_mempolicy_DEPENDENCIES = libtests.a
++get_process_reaper_SOURCES = get_process_reaper.c
++get_process_reaper_OBJECTS = get_process_reaper.$(OBJEXT)
++get_process_reaper_LDADD = $(LDADD)
++get_process_reaper_DEPENDENCIES = libtests.a
+ getcpu_SOURCES = getcpu.c
+ getcpu_OBJECTS = getcpu.$(OBJEXT)
+ getcpu_LDADD = $(LDADD)
+@@ -3265,30 +3269,30 @@ am__depfiles_remade = ./$(DEPDIR)/_newselect-P.Po \
+ 	./$(DEPDIR)/fsync.Po ./$(DEPDIR)/ftruncate.Po \
+ 	./$(DEPDIR)/ftruncate64-ftruncate64.Po ./$(DEPDIR)/futex.Po \
+ 	./$(DEPDIR)/futimesat.Po ./$(DEPDIR)/get_mempolicy.Po \
+-	./$(DEPDIR)/getcpu.Po ./$(DEPDIR)/getcwd.Po \
+-	./$(DEPDIR)/getdents.Po ./$(DEPDIR)/getdents64.Po \
+-	./$(DEPDIR)/getegid.Po ./$(DEPDIR)/getegid32.Po \
+-	./$(DEPDIR)/geteuid.Po ./$(DEPDIR)/geteuid32.Po \
+-	./$(DEPDIR)/getgid.Po ./$(DEPDIR)/getgid32.Po \
+-	./$(DEPDIR)/getgroups.Po ./$(DEPDIR)/getgroups32.Po \
+-	./$(DEPDIR)/getpeername.Po ./$(DEPDIR)/getpgrp.Po \
+-	./$(DEPDIR)/getpid.Po ./$(DEPDIR)/getppid.Po \
+-	./$(DEPDIR)/getrandom.Po ./$(DEPDIR)/getresgid.Po \
+-	./$(DEPDIR)/getresgid32.Po ./$(DEPDIR)/getresuid.Po \
+-	./$(DEPDIR)/getresuid32.Po ./$(DEPDIR)/getrlimit.Po \
+-	./$(DEPDIR)/getrusage.Po ./$(DEPDIR)/getsid.Po \
+-	./$(DEPDIR)/getsockname.Po ./$(DEPDIR)/gettid.Po \
+-	./$(DEPDIR)/getuid.Po ./$(DEPDIR)/getuid32.Po \
+-	./$(DEPDIR)/getxxid.Po ./$(DEPDIR)/group_req.Po \
+-	./$(DEPDIR)/inet-cmsg.Po ./$(DEPDIR)/init_module.Po \
+-	./$(DEPDIR)/inject-nf.Po ./$(DEPDIR)/inotify.Po \
+-	./$(DEPDIR)/inotify_init-y.Po ./$(DEPDIR)/inotify_init.Po \
+-	./$(DEPDIR)/inotify_init1-y.Po ./$(DEPDIR)/inotify_init1.Po \
+-	./$(DEPDIR)/int_0x80.Po ./$(DEPDIR)/io_uring_enter.Po \
+-	./$(DEPDIR)/io_uring_register.Po ./$(DEPDIR)/io_uring_setup.Po \
+-	./$(DEPDIR)/ioctl.Po ./$(DEPDIR)/ioctl_block.Po \
+-	./$(DEPDIR)/ioctl_dm-v.Po ./$(DEPDIR)/ioctl_dm.Po \
+-	./$(DEPDIR)/ioctl_evdev-Xabbrev.Po \
++	./$(DEPDIR)/get_process_reaper.Po ./$(DEPDIR)/getcpu.Po \
++	./$(DEPDIR)/getcwd.Po ./$(DEPDIR)/getdents.Po \
++	./$(DEPDIR)/getdents64.Po ./$(DEPDIR)/getegid.Po \
++	./$(DEPDIR)/getegid32.Po ./$(DEPDIR)/geteuid.Po \
++	./$(DEPDIR)/geteuid32.Po ./$(DEPDIR)/getgid.Po \
++	./$(DEPDIR)/getgid32.Po ./$(DEPDIR)/getgroups.Po \
++	./$(DEPDIR)/getgroups32.Po ./$(DEPDIR)/getpeername.Po \
++	./$(DEPDIR)/getpgrp.Po ./$(DEPDIR)/getpid.Po \
++	./$(DEPDIR)/getppid.Po ./$(DEPDIR)/getrandom.Po \
++	./$(DEPDIR)/getresgid.Po ./$(DEPDIR)/getresgid32.Po \
++	./$(DEPDIR)/getresuid.Po ./$(DEPDIR)/getresuid32.Po \
++	./$(DEPDIR)/getrlimit.Po ./$(DEPDIR)/getrusage.Po \
++	./$(DEPDIR)/getsid.Po ./$(DEPDIR)/getsockname.Po \
++	./$(DEPDIR)/gettid.Po ./$(DEPDIR)/getuid.Po \
++	./$(DEPDIR)/getuid32.Po ./$(DEPDIR)/getxxid.Po \
++	./$(DEPDIR)/group_req.Po ./$(DEPDIR)/inet-cmsg.Po \
++	./$(DEPDIR)/init_module.Po ./$(DEPDIR)/inject-nf.Po \
++	./$(DEPDIR)/inotify.Po ./$(DEPDIR)/inotify_init-y.Po \
++	./$(DEPDIR)/inotify_init.Po ./$(DEPDIR)/inotify_init1-y.Po \
++	./$(DEPDIR)/inotify_init1.Po ./$(DEPDIR)/int_0x80.Po \
++	./$(DEPDIR)/io_uring_enter.Po ./$(DEPDIR)/io_uring_register.Po \
++	./$(DEPDIR)/io_uring_setup.Po ./$(DEPDIR)/ioctl.Po \
++	./$(DEPDIR)/ioctl_block.Po ./$(DEPDIR)/ioctl_dm-v.Po \
++	./$(DEPDIR)/ioctl_dm.Po ./$(DEPDIR)/ioctl_evdev-Xabbrev.Po \
+ 	./$(DEPDIR)/ioctl_evdev-Xraw.Po \
+ 	./$(DEPDIR)/ioctl_evdev-Xverbose.Po \
+ 	./$(DEPDIR)/ioctl_evdev-success-Xabbrev.Po \
+@@ -3689,23 +3693,24 @@ SOURCES = $(libtests_a_SOURCES) _newselect.c _newselect-P.c accept.c \
+ 	fstat-Xverbose.c fstat64.c fstat64-Xabbrev.c fstat64-Xraw.c \
+ 	fstat64-Xverbose.c fstatat64.c fstatfs.c fstatfs64.c fsync.c \
+ 	fsync-y.c ftruncate.c ftruncate64.c futex.c futimesat.c \
+-	get_mempolicy.c getcpu.c getcwd.c getdents.c getdents64.c \
+-	getegid.c getegid32.c geteuid.c geteuid32.c getgid.c \
+-	getgid32.c getgroups.c getgroups32.c getpeername.c getpgrp.c \
+-	getpid.c getppid.c getrandom.c getresgid.c getresgid32.c \
+-	getresuid.c getresuid32.c getrlimit.c getrusage.c getsid.c \
+-	getsockname.c gettid.c getuid.c getuid32.c getxxid.c \
+-	group_req.c inet-cmsg.c init_module.c inject-nf.c inotify.c \
+-	inotify_init.c inotify_init-y.c inotify_init1.c \
+-	inotify_init1-y.c int_0x80.c io_uring_enter.c \
+-	io_uring_register.c io_uring_setup.c ioctl.c ioctl_block.c \
+-	ioctl_dm.c ioctl_dm-v.c ioctl_evdev.c ioctl_evdev-Xabbrev.c \
+-	ioctl_evdev-Xraw.c ioctl_evdev-Xverbose.c \
+-	ioctl_evdev-success.c ioctl_evdev-success-Xabbrev.c \
+-	ioctl_evdev-success-Xraw.c ioctl_evdev-success-Xverbose.c \
+-	ioctl_evdev-success-v.c ioctl_evdev-success-v-Xabbrev.c \
+-	ioctl_evdev-success-v-Xraw.c ioctl_evdev-success-v-Xverbose.c \
+-	ioctl_evdev-v.c ioctl_evdev-v-Xabbrev.c ioctl_evdev-v-Xraw.c \
++	get_mempolicy.c get_process_reaper.c getcpu.c getcwd.c \
++	getdents.c getdents64.c getegid.c getegid32.c geteuid.c \
++	geteuid32.c getgid.c getgid32.c getgroups.c getgroups32.c \
++	getpeername.c getpgrp.c getpid.c getppid.c getrandom.c \
++	getresgid.c getresgid32.c getresuid.c getresuid32.c \
++	getrlimit.c getrusage.c getsid.c getsockname.c gettid.c \
++	getuid.c getuid32.c getxxid.c group_req.c inet-cmsg.c \
++	init_module.c inject-nf.c inotify.c inotify_init.c \
++	inotify_init-y.c inotify_init1.c inotify_init1-y.c int_0x80.c \
++	io_uring_enter.c io_uring_register.c io_uring_setup.c ioctl.c \
++	ioctl_block.c ioctl_dm.c ioctl_dm-v.c ioctl_evdev.c \
++	ioctl_evdev-Xabbrev.c ioctl_evdev-Xraw.c \
++	ioctl_evdev-Xverbose.c ioctl_evdev-success.c \
++	ioctl_evdev-success-Xabbrev.c ioctl_evdev-success-Xraw.c \
++	ioctl_evdev-success-Xverbose.c ioctl_evdev-success-v.c \
++	ioctl_evdev-success-v-Xabbrev.c ioctl_evdev-success-v-Xraw.c \
++	ioctl_evdev-success-v-Xverbose.c ioctl_evdev-v.c \
++	ioctl_evdev-v-Xabbrev.c ioctl_evdev-v-Xraw.c \
+ 	ioctl_evdev-v-Xverbose.c ioctl_inotify.c ioctl_kvm_run.c \
+ 	ioctl_kvm_run-v.c ioctl_kvm_run_auxstr_vcpu.c ioctl_loop.c \
+ 	ioctl_loop-nv.c ioctl_loop-v.c ioctl_mtd.c ioctl_nbd.c \
+@@ -3876,23 +3881,24 @@ DIST_SOURCES = $(libtests_a_SOURCES) _newselect.c _newselect-P.c \
+ 	fstat-Xverbose.c fstat64.c fstat64-Xabbrev.c fstat64-Xraw.c \
+ 	fstat64-Xverbose.c fstatat64.c fstatfs.c fstatfs64.c fsync.c \
+ 	fsync-y.c ftruncate.c ftruncate64.c futex.c futimesat.c \
+-	get_mempolicy.c getcpu.c getcwd.c getdents.c getdents64.c \
+-	getegid.c getegid32.c geteuid.c geteuid32.c getgid.c \
+-	getgid32.c getgroups.c getgroups32.c getpeername.c getpgrp.c \
+-	getpid.c getppid.c getrandom.c getresgid.c getresgid32.c \
+-	getresuid.c getresuid32.c getrlimit.c getrusage.c getsid.c \
+-	getsockname.c gettid.c getuid.c getuid32.c getxxid.c \
+-	group_req.c inet-cmsg.c init_module.c inject-nf.c inotify.c \
+-	inotify_init.c inotify_init-y.c inotify_init1.c \
+-	inotify_init1-y.c int_0x80.c io_uring_enter.c \
+-	io_uring_register.c io_uring_setup.c ioctl.c ioctl_block.c \
+-	ioctl_dm.c ioctl_dm-v.c ioctl_evdev.c ioctl_evdev-Xabbrev.c \
+-	ioctl_evdev-Xraw.c ioctl_evdev-Xverbose.c \
+-	ioctl_evdev-success.c ioctl_evdev-success-Xabbrev.c \
+-	ioctl_evdev-success-Xraw.c ioctl_evdev-success-Xverbose.c \
+-	ioctl_evdev-success-v.c ioctl_evdev-success-v-Xabbrev.c \
+-	ioctl_evdev-success-v-Xraw.c ioctl_evdev-success-v-Xverbose.c \
+-	ioctl_evdev-v.c ioctl_evdev-v-Xabbrev.c ioctl_evdev-v-Xraw.c \
++	get_mempolicy.c get_process_reaper.c getcpu.c getcwd.c \
++	getdents.c getdents64.c getegid.c getegid32.c geteuid.c \
++	geteuid32.c getgid.c getgid32.c getgroups.c getgroups32.c \
++	getpeername.c getpgrp.c getpid.c getppid.c getrandom.c \
++	getresgid.c getresgid32.c getresuid.c getresuid32.c \
++	getrlimit.c getrusage.c getsid.c getsockname.c gettid.c \
++	getuid.c getuid32.c getxxid.c group_req.c inet-cmsg.c \
++	init_module.c inject-nf.c inotify.c inotify_init.c \
++	inotify_init-y.c inotify_init1.c inotify_init1-y.c int_0x80.c \
++	io_uring_enter.c io_uring_register.c io_uring_setup.c ioctl.c \
++	ioctl_block.c ioctl_dm.c ioctl_dm-v.c ioctl_evdev.c \
++	ioctl_evdev-Xabbrev.c ioctl_evdev-Xraw.c \
++	ioctl_evdev-Xverbose.c ioctl_evdev-success.c \
++	ioctl_evdev-success-Xabbrev.c ioctl_evdev-success-Xraw.c \
++	ioctl_evdev-success-Xverbose.c ioctl_evdev-success-v.c \
++	ioctl_evdev-success-v-Xabbrev.c ioctl_evdev-success-v-Xraw.c \
++	ioctl_evdev-success-v-Xverbose.c ioctl_evdev-v.c \
++	ioctl_evdev-v-Xabbrev.c ioctl_evdev-v-Xraw.c \
+ 	ioctl_evdev-v-Xverbose.c ioctl_inotify.c ioctl_kvm_run.c \
+ 	ioctl_kvm_run-v.c ioctl_kvm_run_auxstr_vcpu.c ioctl_loop.c \
+ 	ioctl_loop-nv.c ioctl_loop-v.c ioctl_mtd.c ioctl_nbd.c \
+@@ -4421,6 +4427,7 @@ pdfdir = @pdfdir@
+ prefix = @prefix@
+ program_transform_name = @program_transform_name@
+ psdir = @psdir@
++runstatedir = @runstatedir@
+ sbindir = @sbindir@
+ sharedstatedir = @sharedstatedir@
+ srcdir = @srcdir@
+@@ -6165,6 +6172,10 @@ get_mempolicy$(EXEEXT): $(get_mempolicy_OBJECTS) $(get_mempolicy_DEPENDENCIES) $
+ 	@rm -f get_mempolicy$(EXEEXT)
+ 	$(AM_V_CCLD)$(LINK) $(get_mempolicy_OBJECTS) $(get_mempolicy_LDADD) $(LIBS)
+ 
++get_process_reaper$(EXEEXT): $(get_process_reaper_OBJECTS) $(get_process_reaper_DEPENDENCIES) $(EXTRA_get_process_reaper_DEPENDENCIES) 
++	@rm -f get_process_reaper$(EXEEXT)
++	$(AM_V_CCLD)$(LINK) $(get_process_reaper_OBJECTS) $(get_process_reaper_LDADD) $(LIBS)
++
+ getcpu$(EXEEXT): $(getcpu_OBJECTS) $(getcpu_DEPENDENCIES) $(EXTRA_getcpu_DEPENDENCIES) 
+ 	@rm -f getcpu$(EXEEXT)
+ 	$(AM_V_CCLD)$(LINK) $(getcpu_OBJECTS) $(getcpu_LDADD) $(LIBS)
+@@ -8512,6 +8523,7 @@ distclean-compile:
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/futex.Po@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/futimesat.Po@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/get_mempolicy.Po@am__quote@ # am--include-marker
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/get_process_reaper.Po@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/getcpu.Po@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/getcwd.Po@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/getdents.Po@am__quote@ # am--include-marker
+@@ -10222,6 +10234,7 @@ distclean: distclean-am
+ 	-rm -f ./$(DEPDIR)/futex.Po
+ 	-rm -f ./$(DEPDIR)/futimesat.Po
+ 	-rm -f ./$(DEPDIR)/get_mempolicy.Po
++	-rm -f ./$(DEPDIR)/get_process_reaper.Po
+ 	-rm -f ./$(DEPDIR)/getcpu.Po
+ 	-rm -f ./$(DEPDIR)/getcwd.Po
+ 	-rm -f ./$(DEPDIR)/getdents.Po
+@@ -10981,6 +10994,7 @@ maintainer-clean: maintainer-clean-am
+ 	-rm -f ./$(DEPDIR)/futex.Po
+ 	-rm -f ./$(DEPDIR)/futimesat.Po
+ 	-rm -f ./$(DEPDIR)/get_mempolicy.Po
++	-rm -f ./$(DEPDIR)/get_process_reaper.Po
+ 	-rm -f ./$(DEPDIR)/getcpu.Po
+ 	-rm -f ./$(DEPDIR)/getcwd.Po
+ 	-rm -f ./$(DEPDIR)/getdents.Po
+diff --git a/tests-m32/Makefile.am b/tests-m32/Makefile.am
+index f2a5bc6d8..8a5819de2 100644
+--- a/tests-m32/Makefile.am
++++ b/tests-m32/Makefile.am
+@@ -111,6 +111,7 @@ check_PROGRAMS = $(PURE_EXECUTABLES) \
+ 	filter-unavailable \
+ 	fork-f \
+ 	fsync-y \
++	get_process_reaper \
+ 	getpid	\
+ 	getppid	\
+ 	gettid \
+diff --git a/tests-m32/get_process_reaper.c b/tests-m32/get_process_reaper.c
+new file mode 100644
+index 000000000..3c00c584b
+--- /dev/null
++++ b/tests-m32/get_process_reaper.c
+@@ -0,0 +1,108 @@
++/*
++ * Print the process reaper id.
++ *
++ * Copyright (c) 2020 Dmitry V. Levin <ldv@altlinux.org>
++ * All rights reserved.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "tests.h"
++#include <stdio.h>
++#include <unistd.h>
++#include <sys/wait.h>
++
++/* PARENT - CHILD - GRANDCHILD */
++
++static int
++grandchild(int read_fd, int write_fd)
++{
++	/* wait for notification from PARENT about CHILD completion */
++	pid_t pid;
++	if (read(read_fd, &pid, sizeof(pid)) != 0)
++		perror_msg_and_fail("read");
++
++	/* write ppid to PARENT */
++	pid = getppid();
++	if (write(write_fd, &pid, sizeof(pid)) != sizeof(pid))
++		perror_msg_and_fail("write");
++
++	_exit(0);
++}
++
++static int
++child(int read_fd, int write_fd)
++{
++	pid_t pid = fork();
++	if (pid < 0)
++		perror_msg_and_fail("fork");
++
++	if (!pid)
++		return grandchild(read_fd, write_fd);
++	else
++		_exit(0);
++}
++
++static int
++parent(pid_t pid, int read_fd, int write_fd)
++{
++	/* wait for CHILD completion */
++	int status;
++	if (waitpid(pid, &status, 0) != pid)
++		perror_msg_and_fail("waitpid");
++	if (status != 0)
++		error_msg_and_fail("status %x", status);
++
++	/* notify GRANDCHILD about CHILD completion */
++	close(write_fd),
++	      write_fd = -1;
++
++	/* read ppid of GRANDCHILD */
++	if (read(read_fd, &pid, sizeof(pid)) != sizeof(pid))
++		perror_msg_and_fail("read");
++
++	printf("%d\n", pid);
++	return 0;
++}
++
++int
++main(void)
++{
++	int parent_grandchild_fds[2];
++#define parent_read_fd		parent_grandchild_fds[0]
++#define grandchild_write_fd	parent_grandchild_fds[1]
++
++	int grandchild_parent_fds[2];
++#define	grandchild_read_fd	grandchild_parent_fds[0]
++#define	parent_write_fd		grandchild_parent_fds[1]
++
++	if (pipe(parent_grandchild_fds) ||
++	    pipe(grandchild_parent_fds))
++		perror_msg_and_fail("pipe");
++
++	pid_t pid = fork();
++	if (pid < 0)
++		perror_msg_and_fail("fork");
++
++	if (!pid) {
++		/* CHILD */
++		close(parent_read_fd),
++		      parent_read_fd = -1;
++
++		close(parent_write_fd),
++		      parent_write_fd = -1;
++
++		return child(grandchild_read_fd,
++			     grandchild_write_fd);
++	} else {
++		/* PARENT */
++		close(grandchild_read_fd),
++		      grandchild_read_fd = -1;
++
++		close(grandchild_write_fd),
++		      grandchild_write_fd = -1;
++
++		return parent(pid, parent_read_fd,
++				   parent_write_fd);
++	}
++}
+diff --git a/tests-m32/strace-DDD.test b/tests-m32/strace-DDD.test
+index e478ae5e8..671600bbe 100755
+--- a/tests-m32/strace-DDD.test
++++ b/tests-m32/strace-DDD.test
+@@ -19,10 +19,14 @@ stat_file=/proc/self/stat
+ [ -f "$stat_file" ] ||
+ 	framework_skip_ "$stat_file is not available"
+ 
++reapid="$(../get_process_reaper)" && [ "$reapid" -ge 1 ] ||
++	fail_ 'get_process_reaper failed'
++
+ set -- -enone -esignal=none ../tracer_ppid_pgid_sid
+ run_strace "$@" > "$OUT"
+ read -r ppid pgid sid < "$OUT" &&
+ [ "$ppid" -gt 1 ] &&
++[ "$ppid" -ne "$reapid" ] &&
+ [ "$pgid" -ge 0 ] &&
+ [ "$sid" -ge 0 ] || {
+ 	cat < "$OUT" > "$LOG"
+@@ -35,7 +39,7 @@ sid0="$sid"
+ 
+ run_strace -D "$@" > "$OUT"
+ read -r ppid pgid sid < "$OUT" &&
+-[ "$ppid" -eq 1 ] &&
++[ "$ppid" -eq "$reapid" ] &&
+ [ "$pgid" = "$pgid0" ] &&
+ [ "$sid" = "$sid0" ] || {
+ 	cat < "$OUT" > "$LOG"
+@@ -45,8 +49,9 @@ match_diff
+ 
+ run_strace -DD "$@" > "$OUT"
+ read -r ppid pgid sid < "$OUT" &&
+-[ "$ppid" -eq 1 ] &&
++[ "$ppid" -eq "$reapid" ] &&
+ [ "$pgid" -gt 1 ] &&
++[ "$pgid" -ne "$reapid" ] &&
+ [ "$pgid" != "$pgid0" ] &&
+ [ "$pgid" != "$sid" ] &&
+ [ "$sid" = "$sid0" ] || {
+@@ -57,8 +62,9 @@ match_diff
+ 
+ run_strace -DDD "$@" > "$OUT"
+ read -r ppid pgid sid < "$OUT" &&
+-[ "$ppid" -eq 1 ] &&
++[ "$ppid" -eq "$reapid" ] &&
+ [ "$pgid" -gt 1 ] &&
++[ "$pgid" -ne "$reapid" ] &&
+ [ "$pgid" != "$pgid0" ] &&
+ [ "$sid" = "$pgid" ] &&
+ [ "$sid" != "$sid0" ] || {
+diff --git a/tests-m32/Makefile.in b/tests-m32/Makefile.in
+index 309fe4443..783230ecc 100644
+--- a/tests-m32/Makefile.in
++++ b/tests-m32/Makefile.in
+@@ -118,9 +118,9 @@ check_PROGRAMS = $(am__EXEEXT_1) _newselect-P$(EXEEXT) answer$(EXEEXT) \
+ 	count-f$(EXEEXT) delay$(EXEEXT) execve-v$(EXEEXT) \
+ 	execveat-v$(EXEEXT) filter_seccomp-flag$(EXEEXT) \
+ 	filter_seccomp-perf$(EXEEXT) filter-unavailable$(EXEEXT) \
+-	fork-f$(EXEEXT) fsync-y$(EXEEXT) getpid$(EXEEXT) \
+-	getppid$(EXEEXT) gettid$(EXEEXT) inject-nf$(EXEEXT) \
+-	int_0x80$(EXEEXT) ioctl_dm-v$(EXEEXT) \
++	fork-f$(EXEEXT) fsync-y$(EXEEXT) get_process_reaper$(EXEEXT) \
++	getpid$(EXEEXT) getppid$(EXEEXT) gettid$(EXEEXT) \
++	inject-nf$(EXEEXT) int_0x80$(EXEEXT) ioctl_dm-v$(EXEEXT) \
+ 	ioctl_evdev-success$(EXEEXT) \
+ 	ioctl_evdev-success-Xabbrev$(EXEEXT) \
+ 	ioctl_evdev-success-Xraw$(EXEEXT) \
+@@ -944,6 +944,10 @@ get_mempolicy_SOURCES = get_mempolicy.c
+ get_mempolicy_OBJECTS = get_mempolicy.$(OBJEXT)
+ get_mempolicy_LDADD = $(LDADD)
+ get_mempolicy_DEPENDENCIES = libtests.a
++get_process_reaper_SOURCES = get_process_reaper.c
++get_process_reaper_OBJECTS = get_process_reaper.$(OBJEXT)
++get_process_reaper_LDADD = $(LDADD)
++get_process_reaper_DEPENDENCIES = libtests.a
+ getcpu_SOURCES = getcpu.c
+ getcpu_OBJECTS = getcpu.$(OBJEXT)
+ getcpu_LDADD = $(LDADD)
+@@ -3265,30 +3269,30 @@ am__depfiles_remade = ./$(DEPDIR)/_newselect-P.Po \
+ 	./$(DEPDIR)/fsync.Po ./$(DEPDIR)/ftruncate.Po \
+ 	./$(DEPDIR)/ftruncate64-ftruncate64.Po ./$(DEPDIR)/futex.Po \
+ 	./$(DEPDIR)/futimesat.Po ./$(DEPDIR)/get_mempolicy.Po \
+-	./$(DEPDIR)/getcpu.Po ./$(DEPDIR)/getcwd.Po \
+-	./$(DEPDIR)/getdents.Po ./$(DEPDIR)/getdents64.Po \
+-	./$(DEPDIR)/getegid.Po ./$(DEPDIR)/getegid32.Po \
+-	./$(DEPDIR)/geteuid.Po ./$(DEPDIR)/geteuid32.Po \
+-	./$(DEPDIR)/getgid.Po ./$(DEPDIR)/getgid32.Po \
+-	./$(DEPDIR)/getgroups.Po ./$(DEPDIR)/getgroups32.Po \
+-	./$(DEPDIR)/getpeername.Po ./$(DEPDIR)/getpgrp.Po \
+-	./$(DEPDIR)/getpid.Po ./$(DEPDIR)/getppid.Po \
+-	./$(DEPDIR)/getrandom.Po ./$(DEPDIR)/getresgid.Po \
+-	./$(DEPDIR)/getresgid32.Po ./$(DEPDIR)/getresuid.Po \
+-	./$(DEPDIR)/getresuid32.Po ./$(DEPDIR)/getrlimit.Po \
+-	./$(DEPDIR)/getrusage.Po ./$(DEPDIR)/getsid.Po \
+-	./$(DEPDIR)/getsockname.Po ./$(DEPDIR)/gettid.Po \
+-	./$(DEPDIR)/getuid.Po ./$(DEPDIR)/getuid32.Po \
+-	./$(DEPDIR)/getxxid.Po ./$(DEPDIR)/group_req.Po \
+-	./$(DEPDIR)/inet-cmsg.Po ./$(DEPDIR)/init_module.Po \
+-	./$(DEPDIR)/inject-nf.Po ./$(DEPDIR)/inotify.Po \
+-	./$(DEPDIR)/inotify_init-y.Po ./$(DEPDIR)/inotify_init.Po \
+-	./$(DEPDIR)/inotify_init1-y.Po ./$(DEPDIR)/inotify_init1.Po \
+-	./$(DEPDIR)/int_0x80.Po ./$(DEPDIR)/io_uring_enter.Po \
+-	./$(DEPDIR)/io_uring_register.Po ./$(DEPDIR)/io_uring_setup.Po \
+-	./$(DEPDIR)/ioctl.Po ./$(DEPDIR)/ioctl_block.Po \
+-	./$(DEPDIR)/ioctl_dm-v.Po ./$(DEPDIR)/ioctl_dm.Po \
+-	./$(DEPDIR)/ioctl_evdev-Xabbrev.Po \
++	./$(DEPDIR)/get_process_reaper.Po ./$(DEPDIR)/getcpu.Po \
++	./$(DEPDIR)/getcwd.Po ./$(DEPDIR)/getdents.Po \
++	./$(DEPDIR)/getdents64.Po ./$(DEPDIR)/getegid.Po \
++	./$(DEPDIR)/getegid32.Po ./$(DEPDIR)/geteuid.Po \
++	./$(DEPDIR)/geteuid32.Po ./$(DEPDIR)/getgid.Po \
++	./$(DEPDIR)/getgid32.Po ./$(DEPDIR)/getgroups.Po \
++	./$(DEPDIR)/getgroups32.Po ./$(DEPDIR)/getpeername.Po \
++	./$(DEPDIR)/getpgrp.Po ./$(DEPDIR)/getpid.Po \
++	./$(DEPDIR)/getppid.Po ./$(DEPDIR)/getrandom.Po \
++	./$(DEPDIR)/getresgid.Po ./$(DEPDIR)/getresgid32.Po \
++	./$(DEPDIR)/getresuid.Po ./$(DEPDIR)/getresuid32.Po \
++	./$(DEPDIR)/getrlimit.Po ./$(DEPDIR)/getrusage.Po \
++	./$(DEPDIR)/getsid.Po ./$(DEPDIR)/getsockname.Po \
++	./$(DEPDIR)/gettid.Po ./$(DEPDIR)/getuid.Po \
++	./$(DEPDIR)/getuid32.Po ./$(DEPDIR)/getxxid.Po \
++	./$(DEPDIR)/group_req.Po ./$(DEPDIR)/inet-cmsg.Po \
++	./$(DEPDIR)/init_module.Po ./$(DEPDIR)/inject-nf.Po \
++	./$(DEPDIR)/inotify.Po ./$(DEPDIR)/inotify_init-y.Po \
++	./$(DEPDIR)/inotify_init.Po ./$(DEPDIR)/inotify_init1-y.Po \
++	./$(DEPDIR)/inotify_init1.Po ./$(DEPDIR)/int_0x80.Po \
++	./$(DEPDIR)/io_uring_enter.Po ./$(DEPDIR)/io_uring_register.Po \
++	./$(DEPDIR)/io_uring_setup.Po ./$(DEPDIR)/ioctl.Po \
++	./$(DEPDIR)/ioctl_block.Po ./$(DEPDIR)/ioctl_dm-v.Po \
++	./$(DEPDIR)/ioctl_dm.Po ./$(DEPDIR)/ioctl_evdev-Xabbrev.Po \
+ 	./$(DEPDIR)/ioctl_evdev-Xraw.Po \
+ 	./$(DEPDIR)/ioctl_evdev-Xverbose.Po \
+ 	./$(DEPDIR)/ioctl_evdev-success-Xabbrev.Po \
+@@ -3689,23 +3693,24 @@ SOURCES = $(libtests_a_SOURCES) _newselect.c _newselect-P.c accept.c \
+ 	fstat-Xverbose.c fstat64.c fstat64-Xabbrev.c fstat64-Xraw.c \
+ 	fstat64-Xverbose.c fstatat64.c fstatfs.c fstatfs64.c fsync.c \
+ 	fsync-y.c ftruncate.c ftruncate64.c futex.c futimesat.c \
+-	get_mempolicy.c getcpu.c getcwd.c getdents.c getdents64.c \
+-	getegid.c getegid32.c geteuid.c geteuid32.c getgid.c \
+-	getgid32.c getgroups.c getgroups32.c getpeername.c getpgrp.c \
+-	getpid.c getppid.c getrandom.c getresgid.c getresgid32.c \
+-	getresuid.c getresuid32.c getrlimit.c getrusage.c getsid.c \
+-	getsockname.c gettid.c getuid.c getuid32.c getxxid.c \
+-	group_req.c inet-cmsg.c init_module.c inject-nf.c inotify.c \
+-	inotify_init.c inotify_init-y.c inotify_init1.c \
+-	inotify_init1-y.c int_0x80.c io_uring_enter.c \
+-	io_uring_register.c io_uring_setup.c ioctl.c ioctl_block.c \
+-	ioctl_dm.c ioctl_dm-v.c ioctl_evdev.c ioctl_evdev-Xabbrev.c \
+-	ioctl_evdev-Xraw.c ioctl_evdev-Xverbose.c \
+-	ioctl_evdev-success.c ioctl_evdev-success-Xabbrev.c \
+-	ioctl_evdev-success-Xraw.c ioctl_evdev-success-Xverbose.c \
+-	ioctl_evdev-success-v.c ioctl_evdev-success-v-Xabbrev.c \
+-	ioctl_evdev-success-v-Xraw.c ioctl_evdev-success-v-Xverbose.c \
+-	ioctl_evdev-v.c ioctl_evdev-v-Xabbrev.c ioctl_evdev-v-Xraw.c \
++	get_mempolicy.c get_process_reaper.c getcpu.c getcwd.c \
++	getdents.c getdents64.c getegid.c getegid32.c geteuid.c \
++	geteuid32.c getgid.c getgid32.c getgroups.c getgroups32.c \
++	getpeername.c getpgrp.c getpid.c getppid.c getrandom.c \
++	getresgid.c getresgid32.c getresuid.c getresuid32.c \
++	getrlimit.c getrusage.c getsid.c getsockname.c gettid.c \
++	getuid.c getuid32.c getxxid.c group_req.c inet-cmsg.c \
++	init_module.c inject-nf.c inotify.c inotify_init.c \
++	inotify_init-y.c inotify_init1.c inotify_init1-y.c int_0x80.c \
++	io_uring_enter.c io_uring_register.c io_uring_setup.c ioctl.c \
++	ioctl_block.c ioctl_dm.c ioctl_dm-v.c ioctl_evdev.c \
++	ioctl_evdev-Xabbrev.c ioctl_evdev-Xraw.c \
++	ioctl_evdev-Xverbose.c ioctl_evdev-success.c \
++	ioctl_evdev-success-Xabbrev.c ioctl_evdev-success-Xraw.c \
++	ioctl_evdev-success-Xverbose.c ioctl_evdev-success-v.c \
++	ioctl_evdev-success-v-Xabbrev.c ioctl_evdev-success-v-Xraw.c \
++	ioctl_evdev-success-v-Xverbose.c ioctl_evdev-v.c \
++	ioctl_evdev-v-Xabbrev.c ioctl_evdev-v-Xraw.c \
+ 	ioctl_evdev-v-Xverbose.c ioctl_inotify.c ioctl_kvm_run.c \
+ 	ioctl_kvm_run-v.c ioctl_kvm_run_auxstr_vcpu.c ioctl_loop.c \
+ 	ioctl_loop-nv.c ioctl_loop-v.c ioctl_mtd.c ioctl_nbd.c \
+@@ -3876,23 +3881,24 @@ DIST_SOURCES = $(libtests_a_SOURCES) _newselect.c _newselect-P.c \
+ 	fstat-Xverbose.c fstat64.c fstat64-Xabbrev.c fstat64-Xraw.c \
+ 	fstat64-Xverbose.c fstatat64.c fstatfs.c fstatfs64.c fsync.c \
+ 	fsync-y.c ftruncate.c ftruncate64.c futex.c futimesat.c \
+-	get_mempolicy.c getcpu.c getcwd.c getdents.c getdents64.c \
+-	getegid.c getegid32.c geteuid.c geteuid32.c getgid.c \
+-	getgid32.c getgroups.c getgroups32.c getpeername.c getpgrp.c \
+-	getpid.c getppid.c getrandom.c getresgid.c getresgid32.c \
+-	getresuid.c getresuid32.c getrlimit.c getrusage.c getsid.c \
+-	getsockname.c gettid.c getuid.c getuid32.c getxxid.c \
+-	group_req.c inet-cmsg.c init_module.c inject-nf.c inotify.c \
+-	inotify_init.c inotify_init-y.c inotify_init1.c \
+-	inotify_init1-y.c int_0x80.c io_uring_enter.c \
+-	io_uring_register.c io_uring_setup.c ioctl.c ioctl_block.c \
+-	ioctl_dm.c ioctl_dm-v.c ioctl_evdev.c ioctl_evdev-Xabbrev.c \
+-	ioctl_evdev-Xraw.c ioctl_evdev-Xverbose.c \
+-	ioctl_evdev-success.c ioctl_evdev-success-Xabbrev.c \
+-	ioctl_evdev-success-Xraw.c ioctl_evdev-success-Xverbose.c \
+-	ioctl_evdev-success-v.c ioctl_evdev-success-v-Xabbrev.c \
+-	ioctl_evdev-success-v-Xraw.c ioctl_evdev-success-v-Xverbose.c \
+-	ioctl_evdev-v.c ioctl_evdev-v-Xabbrev.c ioctl_evdev-v-Xraw.c \
++	get_mempolicy.c get_process_reaper.c getcpu.c getcwd.c \
++	getdents.c getdents64.c getegid.c getegid32.c geteuid.c \
++	geteuid32.c getgid.c getgid32.c getgroups.c getgroups32.c \
++	getpeername.c getpgrp.c getpid.c getppid.c getrandom.c \
++	getresgid.c getresgid32.c getresuid.c getresuid32.c \
++	getrlimit.c getrusage.c getsid.c getsockname.c gettid.c \
++	getuid.c getuid32.c getxxid.c group_req.c inet-cmsg.c \
++	init_module.c inject-nf.c inotify.c inotify_init.c \
++	inotify_init-y.c inotify_init1.c inotify_init1-y.c int_0x80.c \
++	io_uring_enter.c io_uring_register.c io_uring_setup.c ioctl.c \
++	ioctl_block.c ioctl_dm.c ioctl_dm-v.c ioctl_evdev.c \
++	ioctl_evdev-Xabbrev.c ioctl_evdev-Xraw.c \
++	ioctl_evdev-Xverbose.c ioctl_evdev-success.c \
++	ioctl_evdev-success-Xabbrev.c ioctl_evdev-success-Xraw.c \
++	ioctl_evdev-success-Xverbose.c ioctl_evdev-success-v.c \
++	ioctl_evdev-success-v-Xabbrev.c ioctl_evdev-success-v-Xraw.c \
++	ioctl_evdev-success-v-Xverbose.c ioctl_evdev-v.c \
++	ioctl_evdev-v-Xabbrev.c ioctl_evdev-v-Xraw.c \
+ 	ioctl_evdev-v-Xverbose.c ioctl_inotify.c ioctl_kvm_run.c \
+ 	ioctl_kvm_run-v.c ioctl_kvm_run_auxstr_vcpu.c ioctl_loop.c \
+ 	ioctl_loop-nv.c ioctl_loop-v.c ioctl_mtd.c ioctl_nbd.c \
+@@ -4421,6 +4427,7 @@ pdfdir = @pdfdir@
+ prefix = @prefix@
+ program_transform_name = @program_transform_name@
+ psdir = @psdir@
++runstatedir = @runstatedir@
+ sbindir = @sbindir@
+ sharedstatedir = @sharedstatedir@
+ srcdir = @srcdir@
+@@ -6165,6 +6172,10 @@ get_mempolicy$(EXEEXT): $(get_mempolicy_OBJECTS) $(get_mempolicy_DEPENDENCIES) $
+ 	@rm -f get_mempolicy$(EXEEXT)
+ 	$(AM_V_CCLD)$(LINK) $(get_mempolicy_OBJECTS) $(get_mempolicy_LDADD) $(LIBS)
+ 
++get_process_reaper$(EXEEXT): $(get_process_reaper_OBJECTS) $(get_process_reaper_DEPENDENCIES) $(EXTRA_get_process_reaper_DEPENDENCIES) 
++	@rm -f get_process_reaper$(EXEEXT)
++	$(AM_V_CCLD)$(LINK) $(get_process_reaper_OBJECTS) $(get_process_reaper_LDADD) $(LIBS)
++
+ getcpu$(EXEEXT): $(getcpu_OBJECTS) $(getcpu_DEPENDENCIES) $(EXTRA_getcpu_DEPENDENCIES) 
+ 	@rm -f getcpu$(EXEEXT)
+ 	$(AM_V_CCLD)$(LINK) $(getcpu_OBJECTS) $(getcpu_LDADD) $(LIBS)
+@@ -8512,6 +8523,7 @@ distclean-compile:
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/futex.Po@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/futimesat.Po@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/get_mempolicy.Po@am__quote@ # am--include-marker
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/get_process_reaper.Po@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/getcpu.Po@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/getcwd.Po@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/getdents.Po@am__quote@ # am--include-marker
+@@ -10222,6 +10234,7 @@ distclean: distclean-am
+ 	-rm -f ./$(DEPDIR)/futex.Po
+ 	-rm -f ./$(DEPDIR)/futimesat.Po
+ 	-rm -f ./$(DEPDIR)/get_mempolicy.Po
++	-rm -f ./$(DEPDIR)/get_process_reaper.Po
+ 	-rm -f ./$(DEPDIR)/getcpu.Po
+ 	-rm -f ./$(DEPDIR)/getcwd.Po
+ 	-rm -f ./$(DEPDIR)/getdents.Po
+@@ -10981,6 +10994,7 @@ maintainer-clean: maintainer-clean-am
+ 	-rm -f ./$(DEPDIR)/futex.Po
+ 	-rm -f ./$(DEPDIR)/futimesat.Po
+ 	-rm -f ./$(DEPDIR)/get_mempolicy.Po
++	-rm -f ./$(DEPDIR)/get_process_reaper.Po
+ 	-rm -f ./$(DEPDIR)/getcpu.Po
+ 	-rm -f ./$(DEPDIR)/getcwd.Po
+ 	-rm -f ./$(DEPDIR)/getdents.Po
+diff --git a/tests-mx32/Makefile.am b/tests-mx32/Makefile.am
+index f2a5bc6d8..8a5819de2 100644
+--- a/tests-mx32/Makefile.am
++++ b/tests-mx32/Makefile.am
+@@ -111,6 +111,7 @@ check_PROGRAMS = $(PURE_EXECUTABLES) \
+ 	filter-unavailable \
+ 	fork-f \
+ 	fsync-y \
++	get_process_reaper \
+ 	getpid	\
+ 	getppid	\
+ 	gettid \
+diff --git a/tests-mx32/get_process_reaper.c b/tests-mx32/get_process_reaper.c
+new file mode 100644
+index 000000000..3c00c584b
+--- /dev/null
++++ b/tests-mx32/get_process_reaper.c
+@@ -0,0 +1,108 @@
++/*
++ * Print the process reaper id.
++ *
++ * Copyright (c) 2020 Dmitry V. Levin <ldv@altlinux.org>
++ * All rights reserved.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "tests.h"
++#include <stdio.h>
++#include <unistd.h>
++#include <sys/wait.h>
++
++/* PARENT - CHILD - GRANDCHILD */
++
++static int
++grandchild(int read_fd, int write_fd)
++{
++	/* wait for notification from PARENT about CHILD completion */
++	pid_t pid;
++	if (read(read_fd, &pid, sizeof(pid)) != 0)
++		perror_msg_and_fail("read");
++
++	/* write ppid to PARENT */
++	pid = getppid();
++	if (write(write_fd, &pid, sizeof(pid)) != sizeof(pid))
++		perror_msg_and_fail("write");
++
++	_exit(0);
++}
++
++static int
++child(int read_fd, int write_fd)
++{
++	pid_t pid = fork();
++	if (pid < 0)
++		perror_msg_and_fail("fork");
++
++	if (!pid)
++		return grandchild(read_fd, write_fd);
++	else
++		_exit(0);
++}
++
++static int
++parent(pid_t pid, int read_fd, int write_fd)
++{
++	/* wait for CHILD completion */
++	int status;
++	if (waitpid(pid, &status, 0) != pid)
++		perror_msg_and_fail("waitpid");
++	if (status != 0)
++		error_msg_and_fail("status %x", status);
++
++	/* notify GRANDCHILD about CHILD completion */
++	close(write_fd),
++	      write_fd = -1;
++
++	/* read ppid of GRANDCHILD */
++	if (read(read_fd, &pid, sizeof(pid)) != sizeof(pid))
++		perror_msg_and_fail("read");
++
++	printf("%d\n", pid);
++	return 0;
++}
++
++int
++main(void)
++{
++	int parent_grandchild_fds[2];
++#define parent_read_fd		parent_grandchild_fds[0]
++#define grandchild_write_fd	parent_grandchild_fds[1]
++
++	int grandchild_parent_fds[2];
++#define	grandchild_read_fd	grandchild_parent_fds[0]
++#define	parent_write_fd		grandchild_parent_fds[1]
++
++	if (pipe(parent_grandchild_fds) ||
++	    pipe(grandchild_parent_fds))
++		perror_msg_and_fail("pipe");
++
++	pid_t pid = fork();
++	if (pid < 0)
++		perror_msg_and_fail("fork");
++
++	if (!pid) {
++		/* CHILD */
++		close(parent_read_fd),
++		      parent_read_fd = -1;
++
++		close(parent_write_fd),
++		      parent_write_fd = -1;
++
++		return child(grandchild_read_fd,
++			     grandchild_write_fd);
++	} else {
++		/* PARENT */
++		close(grandchild_read_fd),
++		      grandchild_read_fd = -1;
++
++		close(grandchild_write_fd),
++		      grandchild_write_fd = -1;
++
++		return parent(pid, parent_read_fd,
++				   parent_write_fd);
++	}
++}
+diff --git a/tests-mx32/strace-DDD.test b/tests-mx32/strace-DDD.test
+index e478ae5e8..671600bbe 100755
+--- a/tests-mx32/strace-DDD.test
++++ b/tests-mx32/strace-DDD.test
+@@ -19,10 +19,14 @@ stat_file=/proc/self/stat
+ [ -f "$stat_file" ] ||
+ 	framework_skip_ "$stat_file is not available"
+ 
++reapid="$(../get_process_reaper)" && [ "$reapid" -ge 1 ] ||
++	fail_ 'get_process_reaper failed'
++
+ set -- -enone -esignal=none ../tracer_ppid_pgid_sid
+ run_strace "$@" > "$OUT"
+ read -r ppid pgid sid < "$OUT" &&
+ [ "$ppid" -gt 1 ] &&
++[ "$ppid" -ne "$reapid" ] &&
+ [ "$pgid" -ge 0 ] &&
+ [ "$sid" -ge 0 ] || {
+ 	cat < "$OUT" > "$LOG"
+@@ -35,7 +39,7 @@ sid0="$sid"
+ 
+ run_strace -D "$@" > "$OUT"
+ read -r ppid pgid sid < "$OUT" &&
+-[ "$ppid" -eq 1 ] &&
++[ "$ppid" -eq "$reapid" ] &&
+ [ "$pgid" = "$pgid0" ] &&
+ [ "$sid" = "$sid0" ] || {
+ 	cat < "$OUT" > "$LOG"
+@@ -45,8 +49,9 @@ match_diff
+ 
+ run_strace -DD "$@" > "$OUT"
+ read -r ppid pgid sid < "$OUT" &&
+-[ "$ppid" -eq 1 ] &&
++[ "$ppid" -eq "$reapid" ] &&
+ [ "$pgid" -gt 1 ] &&
++[ "$pgid" -ne "$reapid" ] &&
+ [ "$pgid" != "$pgid0" ] &&
+ [ "$pgid" != "$sid" ] &&
+ [ "$sid" = "$sid0" ] || {
+@@ -57,8 +62,9 @@ match_diff
+ 
+ run_strace -DDD "$@" > "$OUT"
+ read -r ppid pgid sid < "$OUT" &&
+-[ "$ppid" -eq 1 ] &&
++[ "$ppid" -eq "$reapid" ] &&
+ [ "$pgid" -gt 1 ] &&
++[ "$pgid" -ne "$reapid" ] &&
+ [ "$pgid" != "$pgid0" ] &&
+ [ "$sid" = "$pgid" ] &&
+ [ "$sid" != "$sid0" ] || {
+diff --git a/tests-mx32/Makefile.in b/tests-mx32/Makefile.in
+index 309fe4443..783230ecc 100644
+--- a/tests-mx32/Makefile.in
++++ b/tests-mx32/Makefile.in
+@@ -118,9 +118,9 @@ check_PROGRAMS = $(am__EXEEXT_1) _newselect-P$(EXEEXT) answer$(EXEEXT) \
+ 	count-f$(EXEEXT) delay$(EXEEXT) execve-v$(EXEEXT) \
+ 	execveat-v$(EXEEXT) filter_seccomp-flag$(EXEEXT) \
+ 	filter_seccomp-perf$(EXEEXT) filter-unavailable$(EXEEXT) \
+-	fork-f$(EXEEXT) fsync-y$(EXEEXT) getpid$(EXEEXT) \
+-	getppid$(EXEEXT) gettid$(EXEEXT) inject-nf$(EXEEXT) \
+-	int_0x80$(EXEEXT) ioctl_dm-v$(EXEEXT) \
++	fork-f$(EXEEXT) fsync-y$(EXEEXT) get_process_reaper$(EXEEXT) \
++	getpid$(EXEEXT) getppid$(EXEEXT) gettid$(EXEEXT) \
++	inject-nf$(EXEEXT) int_0x80$(EXEEXT) ioctl_dm-v$(EXEEXT) \
+ 	ioctl_evdev-success$(EXEEXT) \
+ 	ioctl_evdev-success-Xabbrev$(EXEEXT) \
+ 	ioctl_evdev-success-Xraw$(EXEEXT) \
+@@ -944,6 +944,10 @@ get_mempolicy_SOURCES = get_mempolicy.c
+ get_mempolicy_OBJECTS = get_mempolicy.$(OBJEXT)
+ get_mempolicy_LDADD = $(LDADD)
+ get_mempolicy_DEPENDENCIES = libtests.a
++get_process_reaper_SOURCES = get_process_reaper.c
++get_process_reaper_OBJECTS = get_process_reaper.$(OBJEXT)
++get_process_reaper_LDADD = $(LDADD)
++get_process_reaper_DEPENDENCIES = libtests.a
+ getcpu_SOURCES = getcpu.c
+ getcpu_OBJECTS = getcpu.$(OBJEXT)
+ getcpu_LDADD = $(LDADD)
+@@ -3265,30 +3269,30 @@ am__depfiles_remade = ./$(DEPDIR)/_newselect-P.Po \
+ 	./$(DEPDIR)/fsync.Po ./$(DEPDIR)/ftruncate.Po \
+ 	./$(DEPDIR)/ftruncate64-ftruncate64.Po ./$(DEPDIR)/futex.Po \
+ 	./$(DEPDIR)/futimesat.Po ./$(DEPDIR)/get_mempolicy.Po \
+-	./$(DEPDIR)/getcpu.Po ./$(DEPDIR)/getcwd.Po \
+-	./$(DEPDIR)/getdents.Po ./$(DEPDIR)/getdents64.Po \
+-	./$(DEPDIR)/getegid.Po ./$(DEPDIR)/getegid32.Po \
+-	./$(DEPDIR)/geteuid.Po ./$(DEPDIR)/geteuid32.Po \
+-	./$(DEPDIR)/getgid.Po ./$(DEPDIR)/getgid32.Po \
+-	./$(DEPDIR)/getgroups.Po ./$(DEPDIR)/getgroups32.Po \
+-	./$(DEPDIR)/getpeername.Po ./$(DEPDIR)/getpgrp.Po \
+-	./$(DEPDIR)/getpid.Po ./$(DEPDIR)/getppid.Po \
+-	./$(DEPDIR)/getrandom.Po ./$(DEPDIR)/getresgid.Po \
+-	./$(DEPDIR)/getresgid32.Po ./$(DEPDIR)/getresuid.Po \
+-	./$(DEPDIR)/getresuid32.Po ./$(DEPDIR)/getrlimit.Po \
+-	./$(DEPDIR)/getrusage.Po ./$(DEPDIR)/getsid.Po \
+-	./$(DEPDIR)/getsockname.Po ./$(DEPDIR)/gettid.Po \
+-	./$(DEPDIR)/getuid.Po ./$(DEPDIR)/getuid32.Po \
+-	./$(DEPDIR)/getxxid.Po ./$(DEPDIR)/group_req.Po \
+-	./$(DEPDIR)/inet-cmsg.Po ./$(DEPDIR)/init_module.Po \
+-	./$(DEPDIR)/inject-nf.Po ./$(DEPDIR)/inotify.Po \
+-	./$(DEPDIR)/inotify_init-y.Po ./$(DEPDIR)/inotify_init.Po \
+-	./$(DEPDIR)/inotify_init1-y.Po ./$(DEPDIR)/inotify_init1.Po \
+-	./$(DEPDIR)/int_0x80.Po ./$(DEPDIR)/io_uring_enter.Po \
+-	./$(DEPDIR)/io_uring_register.Po ./$(DEPDIR)/io_uring_setup.Po \
+-	./$(DEPDIR)/ioctl.Po ./$(DEPDIR)/ioctl_block.Po \
+-	./$(DEPDIR)/ioctl_dm-v.Po ./$(DEPDIR)/ioctl_dm.Po \
+-	./$(DEPDIR)/ioctl_evdev-Xabbrev.Po \
++	./$(DEPDIR)/get_process_reaper.Po ./$(DEPDIR)/getcpu.Po \
++	./$(DEPDIR)/getcwd.Po ./$(DEPDIR)/getdents.Po \
++	./$(DEPDIR)/getdents64.Po ./$(DEPDIR)/getegid.Po \
++	./$(DEPDIR)/getegid32.Po ./$(DEPDIR)/geteuid.Po \
++	./$(DEPDIR)/geteuid32.Po ./$(DEPDIR)/getgid.Po \
++	./$(DEPDIR)/getgid32.Po ./$(DEPDIR)/getgroups.Po \
++	./$(DEPDIR)/getgroups32.Po ./$(DEPDIR)/getpeername.Po \
++	./$(DEPDIR)/getpgrp.Po ./$(DEPDIR)/getpid.Po \
++	./$(DEPDIR)/getppid.Po ./$(DEPDIR)/getrandom.Po \
++	./$(DEPDIR)/getresgid.Po ./$(DEPDIR)/getresgid32.Po \
++	./$(DEPDIR)/getresuid.Po ./$(DEPDIR)/getresuid32.Po \
++	./$(DEPDIR)/getrlimit.Po ./$(DEPDIR)/getrusage.Po \
++	./$(DEPDIR)/getsid.Po ./$(DEPDIR)/getsockname.Po \
++	./$(DEPDIR)/gettid.Po ./$(DEPDIR)/getuid.Po \
++	./$(DEPDIR)/getuid32.Po ./$(DEPDIR)/getxxid.Po \
++	./$(DEPDIR)/group_req.Po ./$(DEPDIR)/inet-cmsg.Po \
++	./$(DEPDIR)/init_module.Po ./$(DEPDIR)/inject-nf.Po \
++	./$(DEPDIR)/inotify.Po ./$(DEPDIR)/inotify_init-y.Po \
++	./$(DEPDIR)/inotify_init.Po ./$(DEPDIR)/inotify_init1-y.Po \
++	./$(DEPDIR)/inotify_init1.Po ./$(DEPDIR)/int_0x80.Po \
++	./$(DEPDIR)/io_uring_enter.Po ./$(DEPDIR)/io_uring_register.Po \
++	./$(DEPDIR)/io_uring_setup.Po ./$(DEPDIR)/ioctl.Po \
++	./$(DEPDIR)/ioctl_block.Po ./$(DEPDIR)/ioctl_dm-v.Po \
++	./$(DEPDIR)/ioctl_dm.Po ./$(DEPDIR)/ioctl_evdev-Xabbrev.Po \
+ 	./$(DEPDIR)/ioctl_evdev-Xraw.Po \
+ 	./$(DEPDIR)/ioctl_evdev-Xverbose.Po \
+ 	./$(DEPDIR)/ioctl_evdev-success-Xabbrev.Po \
+@@ -3689,23 +3693,24 @@ SOURCES = $(libtests_a_SOURCES) _newselect.c _newselect-P.c accept.c \
+ 	fstat-Xverbose.c fstat64.c fstat64-Xabbrev.c fstat64-Xraw.c \
+ 	fstat64-Xverbose.c fstatat64.c fstatfs.c fstatfs64.c fsync.c \
+ 	fsync-y.c ftruncate.c ftruncate64.c futex.c futimesat.c \
+-	get_mempolicy.c getcpu.c getcwd.c getdents.c getdents64.c \
+-	getegid.c getegid32.c geteuid.c geteuid32.c getgid.c \
+-	getgid32.c getgroups.c getgroups32.c getpeername.c getpgrp.c \
+-	getpid.c getppid.c getrandom.c getresgid.c getresgid32.c \
+-	getresuid.c getresuid32.c getrlimit.c getrusage.c getsid.c \
+-	getsockname.c gettid.c getuid.c getuid32.c getxxid.c \
+-	group_req.c inet-cmsg.c init_module.c inject-nf.c inotify.c \
+-	inotify_init.c inotify_init-y.c inotify_init1.c \
+-	inotify_init1-y.c int_0x80.c io_uring_enter.c \
+-	io_uring_register.c io_uring_setup.c ioctl.c ioctl_block.c \
+-	ioctl_dm.c ioctl_dm-v.c ioctl_evdev.c ioctl_evdev-Xabbrev.c \
+-	ioctl_evdev-Xraw.c ioctl_evdev-Xverbose.c \
+-	ioctl_evdev-success.c ioctl_evdev-success-Xabbrev.c \
+-	ioctl_evdev-success-Xraw.c ioctl_evdev-success-Xverbose.c \
+-	ioctl_evdev-success-v.c ioctl_evdev-success-v-Xabbrev.c \
+-	ioctl_evdev-success-v-Xraw.c ioctl_evdev-success-v-Xverbose.c \
+-	ioctl_evdev-v.c ioctl_evdev-v-Xabbrev.c ioctl_evdev-v-Xraw.c \
++	get_mempolicy.c get_process_reaper.c getcpu.c getcwd.c \
++	getdents.c getdents64.c getegid.c getegid32.c geteuid.c \
++	geteuid32.c getgid.c getgid32.c getgroups.c getgroups32.c \
++	getpeername.c getpgrp.c getpid.c getppid.c getrandom.c \
++	getresgid.c getresgid32.c getresuid.c getresuid32.c \
++	getrlimit.c getrusage.c getsid.c getsockname.c gettid.c \
++	getuid.c getuid32.c getxxid.c group_req.c inet-cmsg.c \
++	init_module.c inject-nf.c inotify.c inotify_init.c \
++	inotify_init-y.c inotify_init1.c inotify_init1-y.c int_0x80.c \
++	io_uring_enter.c io_uring_register.c io_uring_setup.c ioctl.c \
++	ioctl_block.c ioctl_dm.c ioctl_dm-v.c ioctl_evdev.c \
++	ioctl_evdev-Xabbrev.c ioctl_evdev-Xraw.c \
++	ioctl_evdev-Xverbose.c ioctl_evdev-success.c \
++	ioctl_evdev-success-Xabbrev.c ioctl_evdev-success-Xraw.c \
++	ioctl_evdev-success-Xverbose.c ioctl_evdev-success-v.c \
++	ioctl_evdev-success-v-Xabbrev.c ioctl_evdev-success-v-Xraw.c \
++	ioctl_evdev-success-v-Xverbose.c ioctl_evdev-v.c \
++	ioctl_evdev-v-Xabbrev.c ioctl_evdev-v-Xraw.c \
+ 	ioctl_evdev-v-Xverbose.c ioctl_inotify.c ioctl_kvm_run.c \
+ 	ioctl_kvm_run-v.c ioctl_kvm_run_auxstr_vcpu.c ioctl_loop.c \
+ 	ioctl_loop-nv.c ioctl_loop-v.c ioctl_mtd.c ioctl_nbd.c \
+@@ -3876,23 +3881,24 @@ DIST_SOURCES = $(libtests_a_SOURCES) _newselect.c _newselect-P.c \
+ 	fstat-Xverbose.c fstat64.c fstat64-Xabbrev.c fstat64-Xraw.c \
+ 	fstat64-Xverbose.c fstatat64.c fstatfs.c fstatfs64.c fsync.c \
+ 	fsync-y.c ftruncate.c ftruncate64.c futex.c futimesat.c \
+-	get_mempolicy.c getcpu.c getcwd.c getdents.c getdents64.c \
+-	getegid.c getegid32.c geteuid.c geteuid32.c getgid.c \
+-	getgid32.c getgroups.c getgroups32.c getpeername.c getpgrp.c \
+-	getpid.c getppid.c getrandom.c getresgid.c getresgid32.c \
+-	getresuid.c getresuid32.c getrlimit.c getrusage.c getsid.c \
+-	getsockname.c gettid.c getuid.c getuid32.c getxxid.c \
+-	group_req.c inet-cmsg.c init_module.c inject-nf.c inotify.c \
+-	inotify_init.c inotify_init-y.c inotify_init1.c \
+-	inotify_init1-y.c int_0x80.c io_uring_enter.c \
+-	io_uring_register.c io_uring_setup.c ioctl.c ioctl_block.c \
+-	ioctl_dm.c ioctl_dm-v.c ioctl_evdev.c ioctl_evdev-Xabbrev.c \
+-	ioctl_evdev-Xraw.c ioctl_evdev-Xverbose.c \
+-	ioctl_evdev-success.c ioctl_evdev-success-Xabbrev.c \
+-	ioctl_evdev-success-Xraw.c ioctl_evdev-success-Xverbose.c \
+-	ioctl_evdev-success-v.c ioctl_evdev-success-v-Xabbrev.c \
+-	ioctl_evdev-success-v-Xraw.c ioctl_evdev-success-v-Xverbose.c \
+-	ioctl_evdev-v.c ioctl_evdev-v-Xabbrev.c ioctl_evdev-v-Xraw.c \
++	get_mempolicy.c get_process_reaper.c getcpu.c getcwd.c \
++	getdents.c getdents64.c getegid.c getegid32.c geteuid.c \
++	geteuid32.c getgid.c getgid32.c getgroups.c getgroups32.c \
++	getpeername.c getpgrp.c getpid.c getppid.c getrandom.c \
++	getresgid.c getresgid32.c getresuid.c getresuid32.c \
++	getrlimit.c getrusage.c getsid.c getsockname.c gettid.c \
++	getuid.c getuid32.c getxxid.c group_req.c inet-cmsg.c \
++	init_module.c inject-nf.c inotify.c inotify_init.c \
++	inotify_init-y.c inotify_init1.c inotify_init1-y.c int_0x80.c \
++	io_uring_enter.c io_uring_register.c io_uring_setup.c ioctl.c \
++	ioctl_block.c ioctl_dm.c ioctl_dm-v.c ioctl_evdev.c \
++	ioctl_evdev-Xabbrev.c ioctl_evdev-Xraw.c \
++	ioctl_evdev-Xverbose.c ioctl_evdev-success.c \
++	ioctl_evdev-success-Xabbrev.c ioctl_evdev-success-Xraw.c \
++	ioctl_evdev-success-Xverbose.c ioctl_evdev-success-v.c \
++	ioctl_evdev-success-v-Xabbrev.c ioctl_evdev-success-v-Xraw.c \
++	ioctl_evdev-success-v-Xverbose.c ioctl_evdev-v.c \
++	ioctl_evdev-v-Xabbrev.c ioctl_evdev-v-Xraw.c \
+ 	ioctl_evdev-v-Xverbose.c ioctl_inotify.c ioctl_kvm_run.c \
+ 	ioctl_kvm_run-v.c ioctl_kvm_run_auxstr_vcpu.c ioctl_loop.c \
+ 	ioctl_loop-nv.c ioctl_loop-v.c ioctl_mtd.c ioctl_nbd.c \
+@@ -4421,6 +4427,7 @@ pdfdir = @pdfdir@
+ prefix = @prefix@
+ program_transform_name = @program_transform_name@
+ psdir = @psdir@
++runstatedir = @runstatedir@
+ sbindir = @sbindir@
+ sharedstatedir = @sharedstatedir@
+ srcdir = @srcdir@
+@@ -6165,6 +6172,10 @@ get_mempolicy$(EXEEXT): $(get_mempolicy_OBJECTS) $(get_mempolicy_DEPENDENCIES) $
+ 	@rm -f get_mempolicy$(EXEEXT)
+ 	$(AM_V_CCLD)$(LINK) $(get_mempolicy_OBJECTS) $(get_mempolicy_LDADD) $(LIBS)
+ 
++get_process_reaper$(EXEEXT): $(get_process_reaper_OBJECTS) $(get_process_reaper_DEPENDENCIES) $(EXTRA_get_process_reaper_DEPENDENCIES) 
++	@rm -f get_process_reaper$(EXEEXT)
++	$(AM_V_CCLD)$(LINK) $(get_process_reaper_OBJECTS) $(get_process_reaper_LDADD) $(LIBS)
++
+ getcpu$(EXEEXT): $(getcpu_OBJECTS) $(getcpu_DEPENDENCIES) $(EXTRA_getcpu_DEPENDENCIES) 
+ 	@rm -f getcpu$(EXEEXT)
+ 	$(AM_V_CCLD)$(LINK) $(getcpu_OBJECTS) $(getcpu_LDADD) $(LIBS)
+@@ -8512,6 +8523,7 @@ distclean-compile:
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/futex.Po@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/futimesat.Po@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/get_mempolicy.Po@am__quote@ # am--include-marker
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/get_process_reaper.Po@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/getcpu.Po@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/getcwd.Po@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/getdents.Po@am__quote@ # am--include-marker
+@@ -10222,6 +10234,7 @@ distclean: distclean-am
+ 	-rm -f ./$(DEPDIR)/futex.Po
+ 	-rm -f ./$(DEPDIR)/futimesat.Po
+ 	-rm -f ./$(DEPDIR)/get_mempolicy.Po
++	-rm -f ./$(DEPDIR)/get_process_reaper.Po
+ 	-rm -f ./$(DEPDIR)/getcpu.Po
+ 	-rm -f ./$(DEPDIR)/getcwd.Po
+ 	-rm -f ./$(DEPDIR)/getdents.Po
+@@ -10981,6 +10994,7 @@ maintainer-clean: maintainer-clean-am
+ 	-rm -f ./$(DEPDIR)/futex.Po
+ 	-rm -f ./$(DEPDIR)/futimesat.Po
+ 	-rm -f ./$(DEPDIR)/get_mempolicy.Po
++	-rm -f ./$(DEPDIR)/get_process_reaper.Po
+ 	-rm -f ./$(DEPDIR)/getcpu.Po
+ 	-rm -f ./$(DEPDIR)/getcwd.Po
+ 	-rm -f ./$(DEPDIR)/getdents.Po

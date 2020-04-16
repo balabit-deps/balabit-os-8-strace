@@ -1,0 +1,33 @@
+--- a/tests/delay.test	2020-04-07 00:51:10.782252775 +0000
++++ b/tests/delay.test	2020-04-07 00:53:23.795013702 +0000
+@@ -9,6 +9,8 @@
+ 
+ . "${srcdir=.}/init.sh"
+ 
++skip_ "Disabling delay for Debian buildds"
++
+ while read -r denter dexit denter_us dexit_us; do
+ 	[ -n "$denter" ] || continue
+ 
+--- a/tests-m32/delay.test	2020-04-07 00:51:10.782252775 +0000
++++ b/tests-m32/delay.test	2020-04-07 00:53:23.795013702 +0000
+@@ -9,6 +9,8 @@
+ 
+ . "${srcdir=.}/init.sh"
+ 
++skip_ "Disabling delay for Debian buildds"
++
+ while read -r denter dexit denter_us dexit_us; do
+ 	[ -n "$denter" ] || continue
+ 
+--- a/tests-mx32/delay.test	2020-04-07 00:51:10.782252775 +0000
++++ b/tests-mx32/delay.test	2020-04-07 00:53:23.795013702 +0000
+@@ -9,6 +9,8 @@
+ 
+ . "${srcdir=.}/init.sh"
+ 
++skip_ "Disabling delay for Debian buildds"
++
+ while read -r denter dexit denter_us dexit_us; do
+ 	[ -n "$denter" ] || continue
+ 

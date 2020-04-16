@@ -1,0 +1,9 @@
+no-arm-unaligned-access
+01-fix_strace-DDD_test
+02-disable_delay_test
+03-disable_mips_umovestr_cached
+04-fix_mips_getuid_tests
+05-fixup_mips_creds_tests
+ptrace-error-verbosity.patch
+kexec_file_load.patch
+0005-XFAIL-multiple-wrong-or-failing-tests-to-fix-FTBFS.patch
