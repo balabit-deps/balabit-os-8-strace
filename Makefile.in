@@ -892,14 +892,14 @@ am__define_uniq_tagged_files = \
 ETAGS = etags
 CTAGS = ctags
 CSCOPE = cscope
-DIST_SUBDIRS = . tests tests-m32 tests-mx32
+DIST_SUBDIRS = $(SUBDIRS)
 am__DIST_COMMON = $(srcdir)/Makefile.in $(srcdir)/config.h.in \
 	$(srcdir)/mpers.am $(srcdir)/scno.am \
 	$(srcdir)/strace-log-merge.1.in $(srcdir)/strace.1.in \
 	$(srcdir)/strace.spec.in $(srcdir)/types/Makemodule.am \
 	$(srcdir)/xlat/Makemodule.am $(top_srcdir)/debian/changelog.in \
-	AUTHORS COPYING INSTALL NEWS README compile config.guess \
-	config.sub depcomp install-sh missing
+	AUTHORS COPYING ChangeLog INSTALL NEWS README compile \
+	config.guess config.sub depcomp install-sh missing
 DISTFILES = $(DIST_COMMON) $(DIST_SOURCES) $(TEXINFOS) $(EXTRA_DIST)
 distdir = $(PACKAGE)-$(VERSION)
 top_distdir = $(distdir)
@@ -1106,7 +1106,7 @@ valgrind_enabled_tools = @valgrind_enabled_tools@
 valgrind_tools = @valgrind_tools@
 @HAVE_M32_RUNTIME_TRUE@TESTS_M32 = tests-m32
 @HAVE_MX32_RUNTIME_TRUE@TESTS_MX32 = tests-mx32
-SUBDIRS = . tests $(TESTS_M32) $(TESTS_MX32)
+SUBDIRS = .
 man_MANS = strace.1 strace-log-merge.1
 bin_SCRIPTS = strace-graph strace-log-merge
 OS = linux
