@@ -1,3 +1,9 @@
+strace (5.5-3ubuntu1bb1) focal; urgency=medium
+
+  * Balabit patched version
+
+ -- Balabit Platform Team <devnull@dev.null>  Fri, 08 Jan 2021 13:35:46 +0100
+
 strace (5.5-3ubuntu1) focal; urgency=medium
 
   * Merge from Debian unstable.  Remaining changes:
